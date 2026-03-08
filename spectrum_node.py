@@ -91,7 +91,7 @@ class SpectrumSDXL:
                 "window_size": ("INT", {"default": 3, "min": 1, "max": 10}),
                 "flex_window": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 2.0, "step": 0.05}),
                 "warmup_steps": ("INT", {"default": 5, "min": 0, "max": 20}),
-                "stop_threshold": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "stop_caching_step": ("INT", {"default": -1, "min": -1, "max": 100, "step": 1}),
             }
         }
 
@@ -99,7 +99,7 @@ class SpectrumSDXL:
     FUNCTION = "patch"
     CATEGORY = "sampling"
 
-    def patch(self, model, w, m, lam, window_size, flex_window, warmup_steps, stop_threshold):
+    def patch(self, model, w, m, lam, window_size, flex_window, warmup_steps, stop_caching_step):
         state = {
             "forecaster": None,
             "cnt": 0,
@@ -107,6 +107,7 @@ class SpectrumSDXL:
             "curr_ws": float(window_size),
             "last_t": -1,  # Init low to force first reset
             "total_runs": 0,  # Debug multi-pass
+            "estimated_total_steps": 50  # Default, updated dynamically
         }
 
         def spectrum_unet_wrapper(model_function, kwargs):
@@ -126,16 +127,21 @@ class SpectrumSDXL:
 
             state["last_t"] = t_scalar
 
-            do_actual = True
-
-            # Normalized timestep (1.0 = start, 0.0 = end)
+            # Update estimated total steps from t_max (for auto stop)
             if state["forecaster"] and state["forecaster"].t_max:
-                t_norm = t_scalar / state["forecaster"].t_max
-                if t_norm < stop_threshold:
-                    do_actual = True
-                    print(f"[Spectrum] Low timestep norm ({t_norm:.2f} < {stop_threshold}) - Force real forward")
+                state["estimated_total_steps"] = int(state["forecaster"].t_max) + 10  # Safe buffer
 
-            if state["cnt"] >= warmup_steps and not do_actual:
+            is_micro_final = False
+            if stop_caching_step == -1:
+                # Auto: stop at ~80% steps
+                auto_stop = int(state["estimated_total_steps"] * 0.8)
+                if state["cnt"] >= auto_stop:
+                    is_micro_final = True
+            elif stop_caching_step > 0 and state["cnt"] >= stop_caching_step:
+                is_micro_final = True
+
+            do_actual = True
+            if state["cnt"] >= warmup_steps and not is_micro_final:
                 do_actual = (state["num_cached"] + 1) % math.floor(state["curr_ws"]) == 0
 
             if do_actual:
