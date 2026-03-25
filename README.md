@@ -1,10 +1,9 @@
 # ComfyUI Spectrum SDXL Node
 
 This repository contains a Unnoficial ComfyUI custom node implementing the **Spectrum** sampling acceleration technique, tailored specifically for SDXL models. Spectrum is a training-free method that forecasts spectral features using Chebyshev polynomials and ridge regression to skip redundant UNet computations, achieving significant speed-ups with less quality loss.
+> **Technical Note:** This implementation has been corrected to be  mathematically faithful to the core Chebyshev regression described in the official Spectrum paper. The node now should work natively across most architectural families (including SDXL, DiTs like Flux, Cosmos, or Anima), it correctly forecasts the **raw spatial model predictions / features / latents** (prior to any sampler ODE integration)
 
-> **Disclaimer:** This implementation caches the outer feature rather than the inner feature approach described in the original paper. 
-
-> **New**: Calibrated Spectrum mode recovers washed-out details by applying residual correction after each real forward pass and blending it into forecasts.
+> **New**: Calibrated Spectrum mode recovers washed-out details by applying **residual correction** after each real forward pass and blending it into forecasts.
 >
 > **Performance comparison** — **Download the images below and drag them into ComfyUI to instantly load optimized workflows!**
 >
@@ -16,7 +15,7 @@ This repository contains a Unnoficial ComfyUI custom node implementing the **Spe
 > | **8.8 s** | **4.8 s** | **4.8 s** | **4.8 s** |
 > | ![Normal2](/images/no_cache2.png) | ![Spectrum2](/images/spectrum2.png) | ![Cal0.5_2](/images/calibrated2-s-0.5.png) | ![Cal0.8_2](/images/calibrated2-s-0.8.png) |
 > | **8.3 s** | **4.6 s** | **4.6 s** | **4.6 s** |
->> **Anima (30-step er-sde)**
+>> **Anima (30-step Euler)**
 >
 > |                   Default                   |                   Spectrum                    |
 > | :-----------------------------------------: | :-------------------------------------------: |
@@ -52,7 +51,7 @@ git clone https://github.com/ruwwww/comfyui-spectrum-sdxl
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`w`**                 | Blending weight between predicted and last true features. Lower values (0.4–0.5) rely more on local momentum, preserving sharpness, while higher values rely on global spectral smoothing. setting `w` to 0 means using Local Taylor based approximation effectively ignoring the global smoothing parameters (`m` and `lam`).                                                                                                    |
 | **`m`**                 | Number of Chebyshev polynomial basis functions (forecast complexity). Lower values (3) are generally more stable for short SDXL runs.                                                                                                                                                               |
-| **`lam`**               | Ridge regularization strength ($\lambda$). High values (1.0) prevent latent explosion, rainbow artifacts, and black outputs in low-precision modes.                                                                                                                                                 |
+| **`lam`**               | Ridge regularization strength ($\lambda$).                                                                                                                                                 |
 | **`window_size`**       | Initial forecasting window size (number of skipped steps).                                                                                                                                                                                                                                          |
 | **`flex_window`**       | Increment added to the window after each actual UNet pass. Higher values result in aggressive acceleration.                                                                                                                                                                                         |
 | **`warmup_steps`**      | Number of initial full-model steps before forecasting begins. Gives the model time to establish composition.                                                                                                                                                                                        |
@@ -68,7 +67,7 @@ For the best balance of **extreme speed** and **high-definition sharpness** (no 
 - **`lam`**: `0.1`
 - **`window_size`**: `2`
 - **`flex_window`**: `0.25`  
-- **`warmup_steps`**: `6` _(DiT models need higher warmup steps eg 8-10)_
+- **`warmup_steps`**: `8` _(DiT models need higher warmup steps eg 8-10)_
 - **`stop_caching_step`**: `22` _(Always set this to Total Steps minus ~3)_
 
 Adjust `flex_window` higher if you want to push speeds further, or lower if you notice structural degradation. 

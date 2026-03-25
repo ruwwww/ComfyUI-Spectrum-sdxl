@@ -46,38 +46,37 @@ class FastChebyshevForecaster:
             self.T_buf.pop(0)
 
     def predict(self, cnt: int, w: float) -> torch.Tensor:
+        if not self.H_buf: return torch.zeros(self.shape, device=torch.device("cpu")).to(self.dtype)
         device = self.H_buf[-1].device
 
         H = torch.stack(self.H_buf, dim=0).to(torch.float32)
         T = torch.tensor(self.T_buf, dtype=torch.float32, device=device)
-
+        
+        P = self.M + 1
         X = self._build_design(T)
-        lamI = self.lam * torch.eye(self.M + 1, device=device)
+        lamI = self.lam * torch.eye(P, device=device)
         XtX = X.T @ X + lamI
 
         try:
             L = torch.linalg.cholesky(XtX)
         except RuntimeError:
-            jitter = 1e-5 * XtX.diag().mean()
-            L = torch.linalg.cholesky(XtX + jitter * torch.eye(self.M + 1, device=device))
+            jitter = 1e-6 * XtX.diag().mean()
+            L = torch.linalg.cholesky(XtX + jitter * torch.eye(P, device=device))
 
         XtH = X.T @ H
         coef = torch.cholesky_solve(XtH, L)
 
         tau_star = torch.tensor([self._taus(cnt)], device=device)
-        x_star = self._build_design(tau_star)
+        pred_cheb = (self._build_design(tau_star) @ coef).squeeze(0)
 
-        pred_cheb = (x_star @ coef).squeeze(0)
+        h_i = self.H_buf[-1]
+        h_taylor = h_i + (h_i - self.H_buf[-2]) if len(self.H_buf) >= 2 else h_i
 
-        if len(self.H_buf) >= 2:
-            h_i = self.H_buf[-1].to(torch.float32)
-            h_im1 = self.H_buf[-2].to(torch.float32)
-            h_taylor = h_i + 0.5 * (h_i - h_im1)
-        else:
-            h_taylor = self.H_buf[-1].to(torch.float32)
-
+        # EXACT Official Logic: Always blend using `w`, even if history is incomplete.
+        # No dynamic degree clamping, no value clamping.
         res = (1 - w) * h_taylor + w * pred_cheb
-        return torch.clamp(res, -10.0, 10.0).to(self.dtype).view(self.shape)  # Milder for SDXL
+            
+        return res.to(self.dtype).view(self.shape)
 
     def reset_buffers(self):
         self.H_buf.clear()
@@ -126,12 +125,22 @@ class SpectrumSDXL:
             "total_runs": 0,
             "estimated_total_steps": steps,
         }
+        
+        # Remove any lingering hooks from previously bypassed models to clear global memory leaks
+        diffusion_model = model.model.diffusion_model
+        if hasattr(diffusion_model, "_sp_hooks"):
+            for h in diffusion_model._sp_hooks: h.remove()
+            diffusion_model._sp_hooks = []
+        if hasattr(diffusion_model, "spectrum_hook_handles"):
+            for h in diffusion_model.spectrum_hook_handles: h.remove()
+            diffusion_model.spectrum_hook_handles = []
+
         forecast_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def spectrum_unet_wrapper(model_function, kwargs):
             x, timestep, c = kwargs["input"], kwargs["timestep"], kwargs["c"]
             batch_size = x.shape[0]
-            t_scalar = timestep[0].item() if isinstance(timestep, torch.Tensor) else float(timestep)
+            t_scalar = timestep[0].item() if isinstance(timestep, torch.Tensor) and timestep.numel() > 0 else float(timestep)
 
             if t_scalar > state["last_t"]:
                 state["forecasters"] = None
@@ -169,36 +178,47 @@ class SpectrumSDXL:
 
             out = torch.empty_like(x)
 
+            # ====================== REAL STEP: Run full diffusion_model → capture RAW 4D tensor (post final_layer/unpatchify) ======================
             if real_mask.any():
                 x_real = x[real_mask]
-                timestep_real = timestep[real_mask.to(timestep.device)] if timestep.shape[0] == batch_size else timestep
+                timestep_real = timestep[real_mask.to(timestep.device)] if isinstance(timestep, torch.Tensor) and timestep.shape[0] == batch_size else timestep
                 c_real = {k: v[real_mask.to(v.device)] if isinstance(v, torch.Tensor) and v.shape[0] == batch_size else v for k, v in c.items()}
+
                 with torch.cuda.stream(torch.cuda.default_stream()):
-                    out_real = model_function(x_real, timestep_real, **c_real)
-                out[real_mask] = out_real
+                    raw_real = model_function(x_real, timestep_real, **c_real)  # ← RAW 4D tensor from diffusion_model
+
+                # ComfyUI's Sampler automatically applies calculate_denoised externally on the UNet's return value
+                out[real_mask] = raw_real
+
+                # Update forecaster with the RAW tensor (Spatial Feature)
                 real_indices = real_mask.nonzero().squeeze()
-                if real_indices.dim() == 0:  
+                if real_indices.dim() == 0:
                     real_indices = [real_indices.item()]
                 else:
                     real_indices = real_indices.tolist()
-                for i, idx in enumerate(real_indices):
-                    state["forecasters"][idx].update(state["cnt"], out_real[i])
-                    state["num_cached"][idx] = 0
-                print(f"[Spectrum] Step {state['cnt']}: Real forward for {real_mask.sum().item()} items")
 
+                for i, idx in enumerate(real_indices):
+                    state["forecasters"][idx].update(state["cnt"], raw_real[i])
+                    state["num_cached"][idx] = 0
+
+                print(f"[Spectrum] Step {state['cnt']}: Real forward (RAW captured) for {real_mask.sum().item()} items")
+
+            # ====================== SKIP STEP: Forecast RAW tensor ======================
             if forecast_mask.any():
                 forecast_indices = forecast_mask.nonzero().squeeze()
-                if forecast_indices.dim() == 0:  
+                if forecast_indices.dim() == 0:
                     forecast_indices = [forecast_indices.item()]
                 else:
                     forecast_indices = forecast_indices.tolist()
-                    
+
                 out_forecast = torch.empty((len(forecast_indices), *x.shape[1:]), device=x.device, dtype=x.dtype)
-                
+
                 if forecast_stream:
                     with torch.cuda.stream(forecast_stream):
                         for j, i in enumerate(forecast_indices):
-                            out_forecast[j] = state["forecasters"][i].predict(state["cnt"], w)
+                            raw_pred = state["forecasters"][i].predict(state["cnt"], w)  # forecasted RAW 4D tensor
+                            out_forecast[j] = raw_pred
+
                         out[forecast_mask] = out_forecast
                         for i in forecast_indices:
                             state["num_cached"][i] += 1
@@ -206,12 +226,14 @@ class SpectrumSDXL:
                 else:
                     # CPU fallback
                     for j, i in enumerate(forecast_indices):
-                        out_forecast[j] = state["forecasters"][i].predict(state["cnt"], w)
+                        raw_pred = state["forecasters"][i].predict(state["cnt"], w)
+                        out_forecast[j] = raw_pred
+
                     out[forecast_mask] = out_forecast
                     for i in forecast_indices:
                         state["num_cached"][i] += 1
-                        
-                print(f"[Spectrum] Step {state['cnt']}: Forecast for {forecast_mask.sum().item()} items")
+
+                print(f"[Spectrum] Step {state['cnt']}: Forecast (RAW predicted) for {forecast_mask.sum().item()} items")
 
             if state["cnt"] >= warmup_steps:
                 state["curr_ws"] += flex_window
@@ -220,8 +242,15 @@ class SpectrumSDXL:
             return out
 
         new_model = model.clone()
+        
+        # SAFEGUARD: Deepcopy model_options to prevent the wrapper from permanently
+        # mutating the globally cached CheckpointLoader model in memory.
+        import copy
+        if hasattr(model, 'model_options'):
+            new_model.model_options = copy.deepcopy(model.model_options)
+            
         new_model.set_model_unet_function_wrapper(spectrum_unet_wrapper)
         return (new_model,)
 
 NODE_CLASS_MAPPINGS = {"SpectrumSDXL": SpectrumSDXL }
-NODE_DISPLAY_NAME_MAPPINGS = {"SpectrumSDXL": "Spectrum Adaptive Forecaster (SDXL)"}
+NODE_DISPLAY_NAME_MAPPINGS = {"SpectrumSDXL": "Spectrum Adaptive Forecaster (Agnostic)"}

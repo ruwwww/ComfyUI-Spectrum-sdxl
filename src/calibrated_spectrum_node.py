@@ -1,4 +1,3 @@
-
 import math
 import torch
 
@@ -31,7 +30,6 @@ class CaliberatedFastChebyshevForecaster2:
         self.residual = None
         self.last_raw_guess = None
 
-    # TODO: Remove hardcoded t_max and 
     def _taus(self, t: float) -> float:
         total = getattr(self, 'total_steps', None) \
             or getattr(self, 't_max', None) \
@@ -73,32 +71,30 @@ class CaliberatedFastChebyshevForecaster2:
         H = torch.stack(self.H_buf, dim=0).to(torch.float32)
         T = torch.tensor(self.T_buf, dtype=torch.float32, device=device)
 
+        P = self.M + 1
         X = self._build_design(T)
-        lamI = self.lam * torch.eye(self.M + 1, device=device)
+        lamI = self.lam * torch.eye(P, device=device)
         XtX = X.T @ X + lamI
 
         try:
             L = torch.linalg.cholesky(XtX)
         except RuntimeError:
-            jitter = 1e-5 * XtX.diag().mean()
-            L = torch.linalg.cholesky(XtX + jitter * torch.eye(self.M + 1, device=device))
+            jitter = 1e-6 * XtX.diag().mean()
+            L = torch.linalg.cholesky(XtX + jitter * torch.eye(P, device=device))
 
         XtH = X.T @ H
         coef = torch.cholesky_solve(XtH, L)
 
         tau_star = torch.tensor([self._taus(cnt)], device=device)
-        x_star = self._build_design(tau_star)
+        pred_cheb = (self._build_design(tau_star) @ coef).squeeze(0)
 
-        pred_cheb = (x_star @ coef).squeeze(0)
+        h_i = self.H_buf[-1]
+        h_taylor = h_i + (h_i - self.H_buf[-2]) if len(self.H_buf) >= 2 else h_i
 
-        if len(self.H_buf) >= 2:
-            h_i = self.H_buf[-1].to(torch.float32)
-            h_im1 = self.H_buf[-2].to(torch.float32)
-            h_taylor = h_i + 0.5 * (h_i - h_im1)
-        else:
-            h_taylor = self.H_buf[-1].to(torch.float32)
-
+        # EXACT Official Logic: Always blend using `w`, even if history is incomplete.
+        # No dynamic degree clamping, no value clamping.
         raw_guess = (1 - w) * h_taylor + w * pred_cheb
+            
         self.last_raw_guess = raw_guess.detach().clone()
 
         if enable_calibration and self.residual is not None:
@@ -107,8 +103,7 @@ class CaliberatedFastChebyshevForecaster2:
         else:
             final_pred = raw_guess
 
-        # TODO: Move away from hard clamping and consider dynamic range estimation or soft clipping
-        return torch.clamp(final_pred, -10.0, 10.0).to(self.dtype).view(self.shape)
+        return final_pred.to(self.dtype).view(self.shape)
 
     def reset_buffers(self):
         self.H_buf.clear()
@@ -143,7 +138,7 @@ class SpectrumSDXLCalibrated:
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    CATEGORY = "sampling/foca"
+    CATEGORY = "sampling"
 
     def patch(self, model, w, m, lam, window_size, flex_window, warmup_steps, stop_caching_step, enable_calibration, calibration_strength, debug, steps=30):
         self.total_steps = steps
@@ -165,6 +160,16 @@ class SpectrumSDXLCalibrated:
             "estimated_total_steps": steps,
             "debug": bool(debug),
         }
+        
+        # Remove any lingering hooks from previously bypassed models to clear global memory leaks
+        diffusion_model = model.model.diffusion_model
+        if hasattr(diffusion_model, "_sp_hooks"):
+            for h in diffusion_model._sp_hooks: h.remove()
+            diffusion_model._sp_hooks = []
+        if hasattr(diffusion_model, "spectrum_hook_handles"):
+            for h in diffusion_model.spectrum_hook_handles: h.remove()
+            diffusion_model.spectrum_hook_handles = []
+
         forecast_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         def _batch_index_tensor(mask: torch.Tensor) -> torch.Tensor:
@@ -175,7 +180,6 @@ class SpectrumSDXLCalibrated:
                 return value[index_tensor.to(value.device)]
             return value
 
-        # TODO: Add Intermediate Feature Extraction isntead of just final output
         def spectrum_unet_wrapper(model_function, kwargs):
             x, timestep, c = kwargs["input"], kwargs["timestep"], kwargs["c"]
             batch_size = x.shape[0]
@@ -278,10 +282,15 @@ class SpectrumSDXLCalibrated:
             return out
 
         new_model = model.clone()
+        
+        # SAFEGUARD: Deepcopy model_options to prevent the wrapper from permanently
+        # mutating the globally cached CheckpointLoader model in memory.
+        import copy
+        if hasattr(model, 'model_options'):
+            new_model.model_options = copy.deepcopy(model.model_options)
+            
         new_model.set_model_unet_function_wrapper(spectrum_unet_wrapper)
         return (new_model,)
 
-
-
 NODE_CLASS_MAPPINGS = {"SpectrumSDXLCalibrated": SpectrumSDXLCalibrated}
-NODE_DISPLAY_NAME_MAPPINGS = {"SpectrumSDXLCalibrated": "Spectrum Adaptive Forecaster with Calibration (SDXL)"}
+NODE_DISPLAY_NAME_MAPPINGS = {"SpectrumSDXLCalibrated": "Spectrum Adaptive Forecaster with Calibration (Agnostic)"}
